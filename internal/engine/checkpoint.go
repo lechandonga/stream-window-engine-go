@@ -28,6 +28,7 @@ func (e *Engine) checkpoint(ctx context.Context, dst sink.Sink) error {
 		Watermark:    e.wm.Get(),
 		NextSeq:      e.nextSeq,
 		SourceOffset: e.srcOffset,
+		SessionSeq:   e.sessionSeq,
 		CreatedAt:    e.now(),
 	}
 	e.mu.Unlock()
@@ -82,7 +83,7 @@ func (e *Engine) Restore(ctx context.Context, cs checkpoint.Store, dst sink.Sink
 	}
 
 	entries := make([]state.SnapshotEntry, 0, len(snap.Entries))
-	var maxSessionSeq int64
+	maxSessionSeq := int64(0)
 	for _, es := range snap.Entries {
 		acc := aggregateNew(e.cfg.Aggregator)
 		acc.Value = es.Value
@@ -109,11 +110,18 @@ func (e *Engine) Restore(ctx context.Context, cs checkpoint.Store, dst sink.Sink
 		return fmt.Errorf("restore state: %w", err)
 	}
 
+	// 会话序号：优先用快照中的计数器本身；旧快照无该字段时
+	// 回退到从存活条目反推（兼容旧格式）。
+	sessionSeq := snap.SessionSeq
+	if sessionSeq < maxSessionSeq {
+		sessionSeq = maxSessionSeq
+	}
+
 	e.mu.Lock()
 	e.wm = watermarkFrom(snap.Watermark)
 	e.gen = generatorFrom(snap.Watermark, e.cfg.Lag)
 	e.srcOffset = snap.SourceOffset
-	e.sessionSeq = maxSessionSeq
+	e.sessionSeq = sessionSeq
 	// NextSeq：以 sink 已确认值与快照值的较大者为准，杜绝重复 Seq。
 	if dst != nil {
 		if ls := dst.LastSeq(); ls >= snap.NextSeq {

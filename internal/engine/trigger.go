@@ -48,6 +48,12 @@ func (e *Engine) trigger(ctx context.Context, dst sink.Sink) error {
 		}
 	}
 
+	// 先发射本屏障内会话合并产生的撤销：下游先删除失效结果，
+	// 再接收（下面触发循环中的）替代结果，视图不留幽灵记录。
+	if err := e.emitRetractions(ctx, dst, curWm); err != nil {
+		return err
+	}
+
 	keys, err := e.store.ListKeys(ctx)
 	if err != nil {
 		return err
@@ -93,6 +99,7 @@ func (e *Engine) trigger(ctx context.Context, dst sink.Sink) error {
 			EmitAt:    now,
 			Watermark: curWm,
 			Late:      kind == aggregate.Correction,
+			ResultID:  aggregate.ResultID(k.Group, k.Win),
 		}
 		if err := e.emit(ctx, dst, &out, k, en); err != nil {
 			return err

@@ -29,6 +29,7 @@ func main() {
 	dir := flag.String("dir", filepath.Join(os.TempDir(), "swe-demo"), "checkpoint/output directory")
 	interrupt := flag.Bool("interrupt", false, "interrupt the source after a few records")
 	conc := flag.Int("concurrency", 4, "group processing concurrency")
+	session := flag.Bool("session", false, "run session-window scenario demonstrating retraction")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -36,30 +37,55 @@ func main() {
 	base := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
 	at := func(sec int64) time.Time { return base.Add(time.Duration(sec) * time.Second) }
 
-	events := []event.Event{
-		{ID: "e01", Key: "room-A", Ts: at(2), Value: 10},
-		{ID: "e02", Key: "room-A", Ts: at(8), Value: 5}, // 乱序但同窗口
-		{ID: "e03", Key: "room-B", Ts: at(3), Value: 7},
-		{ID: "e04", Key: "room-A", Ts: at(14), Value: 2},
-		{ID: "e05", Key: "room-B", Ts: at(25), Value: 0},  // 推进水位线，触发 [0,10)
-		{ID: "e06", Key: "room-A", Ts: at(5), Value: 100}, // 迟到：[0,10) 修正
-		{ID: "e06", Key: "room-A", Ts: at(5), Value: 100}, // 重复投递：必须忽略
-		{ID: "bad-ts", Key: "room-A", Value: 3},           // 缺失时间：记录不静默丢弃
-		{ID: "e07", Key: "room-B", Ts: at(33), Value: 4},
-	}
-
-	cfg := engine.Config{
-		Window:          window.Spec{Kind: window.Tumbling, Size: 10 * time.Second},
-		Aggregator:      "sum_count",
-		Lag:             2 * time.Second,
-		Late:            event.LateInclude,
-		AllowedLateness: 30 * time.Second,
-		Invalid:         event.InvalidReject,
-		FutureBound:     24 * time.Hour,
-		State:           state.Config{MaxActiveKeys: 64, Overflow: state.OverflowBlock},
-		CheckpointDir:   filepath.Join(*dir, "chk"),
-		CheckpointEvery: 1,
-		Concurrency:     *conc,
+	var events []event.Event
+	var cfg engine.Config
+	if *session {
+		// 会话窗口 + 迟到桥接：两个已发布会话被并成一个，
+		// 输出序列中出现 RETRACT（撤销）+ 替代 INSERT。
+		events = []event.Event{
+			{ID: "s1", Key: "room-A", Ts: at(0), Value: 10},
+			{ID: "s2", Key: "room-A", Ts: at(12), Value: 20},
+			{ID: "adv", Key: "room-A", Ts: at(40), Value: 0},   // 推进水位线：发布两个会话
+			{ID: "bridge", Key: "room-A", Ts: at(6), Value: 5}, // 迟到桥接：合并两个会话
+		}
+		cfg = engine.Config{
+			Window:          window.Spec{Kind: window.Session, Gap: 5 * time.Second},
+			Aggregator:      "sum_count",
+			Lag:             0,
+			Late:            event.LateInclude,
+			AllowedLateness: 60 * time.Second,
+			Invalid:         event.InvalidReject,
+			FutureBound:     24 * time.Hour,
+			State:           state.Config{MaxActiveKeys: 64, Overflow: state.OverflowBlock},
+			CheckpointDir:   filepath.Join(*dir, "chk"),
+			CheckpointEvery: 1,
+			Concurrency:     *conc,
+		}
+	} else {
+		events = []event.Event{
+			{ID: "e01", Key: "room-A", Ts: at(2), Value: 10},
+			{ID: "e02", Key: "room-A", Ts: at(8), Value: 5}, // 乱序但同窗口
+			{ID: "e03", Key: "room-B", Ts: at(3), Value: 7},
+			{ID: "e04", Key: "room-A", Ts: at(14), Value: 2},
+			{ID: "e05", Key: "room-B", Ts: at(25), Value: 0},  // 推进水位线，触发 [0,10)
+			{ID: "e06", Key: "room-A", Ts: at(5), Value: 100}, // 迟到：[0,10) 修正
+			{ID: "e06", Key: "room-A", Ts: at(5), Value: 100}, // 重复投递：必须忽略
+			{ID: "bad-ts", Key: "room-A", Value: 3},           // 缺失时间：记录不静默丢弃
+			{ID: "e07", Key: "room-B", Ts: at(33), Value: 4},
+		}
+		cfg = engine.Config{
+			Window:          window.Spec{Kind: window.Tumbling, Size: 10 * time.Second},
+			Aggregator:      "sum_count",
+			Lag:             2 * time.Second,
+			Late:            event.LateInclude,
+			AllowedLateness: 30 * time.Second,
+			Invalid:         event.InvalidReject,
+			FutureBound:     24 * time.Hour,
+			State:           state.Config{MaxActiveKeys: 64, Overflow: state.OverflowBlock},
+			CheckpointDir:   filepath.Join(*dir, "chk"),
+			CheckpointEvery: 1,
+			Concurrency:     *conc,
+		}
 	}
 
 	eng, err := engine.New(cfg,
@@ -90,12 +116,16 @@ func main() {
 		os.Exit(2)
 	}
 
-	fmt.Println("\n===== 已确认聚合输出（INSERT=首次, CORRECTION=迟到修正）=====")
+	fmt.Println("\n===== 已确认聚合输出（INSERT=首次, CORRECTION=迟到修正, RETRACT=撤销）=====")
 	for _, o := range dst.Outputs() {
-		fmt.Printf("seq=%-3d rev=%d %-10s key=%-7s window=[%s,%s) sum=%d count=%d\n",
+		fmt.Printf("seq=%-3d rev=%d %-10s key=%-7s window=[%s,%s) sum=%d count=%d",
 			o.Seq, o.Revision, o.Kind, o.Key,
 			o.Window.Start.Format("15:04:05"), o.Window.End.Format("15:04:05"),
 			o.Value, o.Count)
+		if o.Kind.String() == "RETRACT" {
+			fmt.Printf("  replaced_by=%s", o.ReplacedBy)
+		}
+		fmt.Println()
 	}
 	if sides := dst.Sides(); len(sides) > 0 {
 		fmt.Println("\n===== 旁路记录（迟到/异常，未静默丢弃）=====")

@@ -62,7 +62,13 @@ type Engine struct {
 	reg        *aggregate.Registry
 	nextSeq    int64
 	srcOffset  int64
-	sessionSeq int64 // 单调的会话窗口编号
+	sessionSeq int64 // 单调的会话窗口编号（在串行预处理阶段分配）
+	// pendingRetracts 是本屏障内会话合并产生的待撤销结果。
+	// 只在屏障触发阶段按确定性键序统一发射、发射后清空，
+	// 因此是屏障内瞬时状态：不进检查点、不无界增长，
+	// 崩溃后随状态回退与输入重放被等价重建。
+	retractMu       sync.Mutex
+	pendingRetracts []pendingRetract
 
 	stats Stats
 }
@@ -115,6 +121,9 @@ func New(cfg Config, opts ...Option) (*Engine, error) {
 type prepared struct {
 	ev event.Event
 	wm time.Time // 本批写入统一可见的水位线
+	// sessSeq 仅会话窗口使用：在串行预处理阶段分配的确定性序号，
+	// 与并发度无关，保证同一事件的初始会话标识在任何运行下一致。
+	sessSeq int64
 }
 
 // Run 从 src 消费事件并向 dst 输出，直到源正常结束、ctx 取消或源中断。
@@ -252,9 +261,16 @@ func (e *Engine) prepare(ev event.Event, dst sink.Sink) (prepared, bool, error) 
 		}
 	}
 	curWm := e.wm.Get()
+	var sessSeq int64
+	if e.cfg.Window.Kind == window.Session {
+		// 串行预处理阶段分配会话序号：同一事件在任何并发度/重放下
+		// 得到相同序号，会话窗口标识因此稳定。
+		e.sessionSeq++
+		sessSeq = e.sessionSeq
+	}
 	e.mu.Unlock()
 
-	return prepared{ev: ev, wm: curWm}, true, nil
+	return prepared{ev: ev, wm: curWm, sessSeq: sessSeq}, true, nil
 }
 
 // writeEvent 把已预处理事件写入其所属窗口；按水位线判定迟到并执行策略。
@@ -285,7 +301,7 @@ func (e *Engine) writeEvent(ctx context.Context, p prepared, dst sink.Sink) erro
 		}
 
 		if w.Kind == window.Session {
-			if err := e.applySession(ctx, k, ev, late); err != nil {
+			if err := e.applySession(ctx, k, ev, late, p.sessSeq); err != nil {
 				return err
 			}
 		} else {
@@ -346,6 +362,7 @@ type Stats struct {
 	Rejected    int64
 	Checkpoints int64
 	Spills      int64
+	Retractions int64 // 已发出的撤销条数
 	Watermark   time.Time
 }
 

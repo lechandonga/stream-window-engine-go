@@ -18,9 +18,13 @@ type Snapshot struct {
 	Watermark    time.Time
 	NextSeq      int64
 	SourceOffset int64
-	Entries      []EntrySnapshot
-	SpillFiles   []string
-	CreatedAt    time.Time
+	// SessionSeq 是会话窗口序号计数器本身。必须显式保存：
+	// 从存活条目反推会丢失"已被合并删除的成员"序号，
+	// 导致重放后会话窗口标识漂移。
+	SessionSeq int64
+	Entries    []EntrySnapshot
+	SpillFiles []string
+	CreatedAt  time.Time
 }
 
 // EntrySnapshot 是单个窗口状态的可持久化形式。

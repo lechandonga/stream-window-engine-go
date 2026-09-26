@@ -1,9 +1,11 @@
-// Package aggregate 定义聚合函数、窗口累加状态与可区分新增/修正的输出。
+// Package aggregate 定义聚合函数、窗口累加状态与可区分新增/修正/撤销的输出。
 //
 // 输出语义：
 //   - Insert：某个 (Key, Window) 的首次结果，Revision=1；
 //   - Correction：迟到事件在宽限期内纳入后对已发出结果的修正，
-//     Revision 严格递增；下游可凭 Seq 幂等、凭 Revision 判断新旧。
+//     Revision 严格递增；下游可凭 Seq 幂等、凭 Revision 判断新旧；
+//   - Retract：已发出的 (Key, Window) 结果不再成立（如会话被合并），
+//     下游应将该标识的结果从视图中删除；ReplacedBy 指向替代结果。
 package aggregate
 
 import (
@@ -13,7 +15,7 @@ import (
 	"github.com/lechandonga/stream-window-engine-go/internal/window"
 )
 
-// OutputKind 区分首次输出与修正输出。
+// OutputKind 区分首次输出、修正输出与撤销输出。
 type OutputKind int
 
 const (
@@ -21,29 +23,48 @@ const (
 	Insert OutputKind = iota
 	// Correction 迟到事件纳入后对既有结果的修正。
 	Correction
+	// Retract 撤销一条已发出的结果：该 (Key, Window) 不再成立。
+	Retract
 )
 
 func (k OutputKind) String() string {
-	if k == Insert {
+	switch k {
+	case Insert:
 		return "INSERT"
+	case Correction:
+		return "CORRECTION"
+	case Retract:
+		return "RETRACT"
+	default:
+		return "UNKNOWN"
 	}
-	return "CORRECTION"
+}
+
+// ResultID 返回一个逻辑结果的稳定标识。
+// 只由分组键与窗口（种类/边界/确定性的会话序号）决定，
+// 与运行次数、并发度、重启重放无关；下游以此作为视图主键。
+func ResultID(key string, w window.Window) string {
+	return key + "|" + window.WindowID(w)
 }
 
 // Output 是发往下游的单条聚合结果。
 // Seq 在单个引擎实例内单调递增，作为全局幂等键；
 // Revision 为同一 (Key, Window) 的修订号，首版为 1，每次修正 +1。
+// ResultID 是该结果的稳定标识；RETRACT 记录的 Revision/Value/Count
+// 取自被撤销时刻的已发布状态，ReplacedBy 指向替代结果的 ResultID。
 type Output struct {
-	Seq       int64         `json:"seq"`
-	Revision  int64         `json:"revision"`
-	Kind      OutputKind    `json:"kind"`
-	Key       string        `json:"key"`
-	Window    window.Window `json:"window"`
-	Value     int64         `json:"value"`
-	Count     int64         `json:"count"`
-	EmitAt    time.Time     `json:"emit_at"`
-	Watermark time.Time     `json:"watermark"`
-	Late      bool          `json:"late"`
+	Seq        int64         `json:"seq"`
+	Revision   int64         `json:"revision"`
+	Kind       OutputKind    `json:"kind"`
+	Key        string        `json:"key"`
+	Window     window.Window `json:"window"`
+	Value      int64         `json:"value"`
+	Count      int64         `json:"count"`
+	EmitAt     time.Time     `json:"emit_at"`
+	Watermark  time.Time     `json:"watermark"`
+	Late       bool          `json:"late"`
+	ResultID   string        `json:"result_id"`
+	ReplacedBy string        `json:"replaced_by,omitempty"`
 }
 
 // Accumulator 保存单个 (Key, Window) 的聚合中间状态，

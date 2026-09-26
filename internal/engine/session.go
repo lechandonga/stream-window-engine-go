@@ -14,10 +14,9 @@ import (
 // applySession 把事件写入会话窗口，并与同组中可合并的活动会话合并。
 // 合并规则只取决于时间区间与 Gap，与到达顺序无关；
 // 一个事件初始只属于一个会话，因此不同成员的去重集合互不相交。
-func (e *Engine) applySession(ctx context.Context, k state.Key, ev event.Event, late bool) error {
+// sessSeq 在串行预处理阶段分配，保证同一事件的初始会话标识确定。
+func (e *Engine) applySession(ctx context.Context, k state.Key, ev event.Event, late bool, sessSeq int64) error {
 	e.mu.Lock()
-	e.sessionSeq++
-	mySeq := e.sessionSeq
 	aggName := e.cfg.Aggregator
 	gap := e.cfg.Window.Gap
 	ml, ok := e.mergeLocks[ev.Key]
@@ -32,7 +31,22 @@ func (e *Engine) applySession(ctx context.Context, k state.Key, ev event.Event, 
 	ml.Lock()
 	defer ml.Unlock()
 
-	k.Win.Seq = mySeq
+	// 重复投递/重启重放去重：同组任一会话已见过该事件 ID 则跳过。
+	// 必须在创建新初始会话之前检查——新条目的去重集合为空，
+	// 直接 Add 会让重复事件被二次计数。
+	if ev.ID != "" {
+		dup, err := e.seenInGroup(ctx, ev.Key, ev.ID)
+		if err != nil {
+			return err
+		}
+		if dup {
+			e.logDuplicate(ev, k.Win, e.wm.Get())
+			e.bumpStat(func(s *Stats) { s.Duplicates++ })
+			return nil
+		}
+	}
+
+	k.Win.Seq = sessSeq
 	en, err := e.store.GetOrCreate(ctx, k, aggName)
 	if err != nil {
 		return err
@@ -47,6 +61,30 @@ func (e *Engine) applySession(ctx context.Context, k state.Key, ev event.Event, 
 		e.bumpStat(func(s *Stats) { s.LateHandled++ })
 	}
 	return e.mergeGroup(ctx, ev.Key, gap)
+}
+
+// seenInGroup 报告事件 ID 是否已出现在该分组任一会话窗口的去重集合中。
+// 调用方需持有该分组的合并锁。
+func (e *Engine) seenInGroup(ctx context.Context, group, id string) (bool, error) {
+	keys, err := e.store.ListKeys(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, kk := range keys {
+		if kk.Group != group || kk.Win.Kind != window.Session {
+			continue
+		}
+		en, ok, err := e.store.Get(ctx, kk)
+		if err != nil || !ok {
+			return false, err
+		}
+		if en.Acc != nil {
+			if _, seen := en.Acc.Seen[id]; seen {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 // sessionCluster 是一个确定的会话聚类。
@@ -88,6 +126,16 @@ func clusterSessions(keys []state.Key, gap time.Duration) []sessionCluster {
 }
 
 // mergeGroup 对指定分组执行一次聚类并把多成员聚类落盘为单个条目。
+//
+// 撤销语义（本轮新增）：
+//   - 若被合并的成员已向外发出过结果，且其窗口标识不等于合并目标，
+//     该已发布结果不再成立：登记一条待撤销（含被撤销时的修订号与
+//     聚合值、替代窗口），由屏障触发阶段统一发射 RETRACT；
+//   - 合并目标是新标识：作为全新结果，发射状态重置（下次触发为
+//     INSERT rev1），旧标识的结果通过撤销通道告知下游；
+//   - 合并目标与某成员标识相同（该成员区间覆盖其余成员）：内容并入
+//     既有标识，保留其 Revision/Emitted，标记 Dirty——若已发出过，
+//     下次触发为 CORRECTION，无需撤销。
 func (e *Engine) mergeGroup(ctx context.Context, group string, gap time.Duration) error {
 	keys, err := e.store.ListKeys(ctx)
 	if err != nil {
@@ -107,47 +155,58 @@ func (e *Engine) mergeGroup(ctx context.Context, group string, gap time.Duration
 		if len(c.members) < 2 {
 			continue
 		}
+		type member struct {
+			key state.Key
+			en  *state.Entry
+		}
+		members := make([]member, 0, len(c.members))
 		merged := agg.Init()
-		var revision int64
-		emittedAny, closedAny, dirtyAny := false, false, false
+		closedAny := false
 		for _, mk := range c.members {
 			en, ok, err := e.store.Get(ctx, mk)
 			if err != nil || !ok {
 				return err
 			}
+			members = append(members, member{key: mk, en: en})
 			for id := range en.Acc.Seen {
 				merged.Seen[id] = struct{}{}
 			}
 			// 成员间 Seen 互不相交（事件只进一个初始会话），聚合量直接相加。
 			merged.Value += en.Acc.Value
 			merged.Count += en.Acc.Count
-			revision = maxInt64(revision, en.Revision)
-			emittedAny = emittedAny || en.Emitted
 			closedAny = closedAny || en.Closed
-			dirtyAny = dirtyAny || en.Dirty
 		}
 		target := state.Key{Group: group, Win: c.win}
-		if err := e.store.Put(target, &state.Entry{
-			Acc: merged, Revision: revision, Emitted: emittedAny,
-			Closed: closedAny, Dirty: dirtyAny,
-		}); err != nil {
-			return err
-		}
-		for _, mk := range c.members {
-			if mk == target {
+		out := &state.Entry{Acc: merged, Closed: closedAny}
+		for _, m := range members {
+			if m.key == target {
+				// 标识保留：沿用既有发射状态；内容必然变化（有新成员并入）。
+				out.Emitted = m.en.Emitted
+				out.Revision = m.en.Revision
+				out.Dirty = true
 				continue
 			}
-			if err := e.store.Delete(mk); err != nil {
+			if m.en.Emitted {
+				e.noteRetract(pendingRetract{
+					key:        m.key,
+					revision:   m.en.Revision,
+					value:      m.en.Acc.Value,
+					count:      m.en.Acc.Count,
+					replacedBy: c.win,
+				})
+			}
+		}
+		if err := e.store.Put(target, out); err != nil {
+			return err
+		}
+		for _, m := range members {
+			if m.key == target {
+				continue
+			}
+			if err := e.store.Delete(m.key); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
-}
-
-func maxInt64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
 }
