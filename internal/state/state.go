@@ -13,6 +13,7 @@ package state
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/lechandonga/stream-window-engine-go/internal/aggregate"
 	"github.com/lechandonga/stream-window-engine-go/internal/event"
@@ -35,6 +36,26 @@ type Entry struct {
 	Emitted  bool
 	Closed   bool // 窗口已触发且宽限期结束
 	Dirty    bool // 自上次发出后有（迟到）更新，下一次触发为 CORRECTION
+	// MaxEvent 仅会话窗口使用：会话内最晚事件时间。
+	// 会话窗口的 End 由 maxEvent+Gap 决定（而非初始窗口的 ts+Gap），
+	// 追踪它可保证乱序到达下合并结果与顺序无关。
+	MaxEvent time.Time
+	// Pending 是尚待在屏障点发出的撤销记录，仅存活会话条目携带：
+	// 当本会话合并了其他已发布会话时，被合并会话的撤销在此排队，
+	// 随本会话的替代结果在同一屏障确定性发出，发出成功后清空。
+	Pending []Retraction
+}
+
+// Retraction 描述一条需要撤销的、此前已发布的结果快照。
+// 它由会话合并产生：被并入会话的最后一次发布内容记录于此，
+// 引擎在屏障点将其作为 aggregate.Retract 输出发给下游。
+type Retraction struct {
+	ResultID string
+	Revision int64
+	Win      window.Window
+	Value    int64
+	Count    int64
+	Late     bool
 }
 
 // OverflowPolicy 达到内存上限时的策略。

@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/lechandonga/stream-window-engine-go/internal/aggregate"
 	"github.com/lechandonga/stream-window-engine-go/internal/engine"
 	"github.com/lechandonga/stream-window-engine-go/internal/event"
 	"github.com/lechandonga/stream-window-engine-go/internal/sink"
@@ -90,12 +91,20 @@ func main() {
 		os.Exit(2)
 	}
 
-	fmt.Println("\n===== 已确认聚合输出（INSERT=首次, CORRECTION=迟到修正）=====")
+	fmt.Println("\n===== 已确认聚合输出（INSERT=首次, CORRECTION=迟到修正, RETRACT=撤销）=====")
 	for _, o := range dst.Outputs() {
-		fmt.Printf("seq=%-3d rev=%d %-10s key=%-7s window=[%s,%s) sum=%d count=%d\n",
-			o.Seq, o.Revision, o.Kind, o.Key,
-			o.Window.Start.Format("15:04:05"), o.Window.End.Format("15:04:05"),
-			o.Value, o.Count)
+		switch o.Kind {
+		case aggregate.Retract:
+			fmt.Printf("seq=%-3d %-10s result=%-28s key=%-7s window=[%s,%s) sum=%d count=%d -> 被 %s 取代\n",
+				o.Seq, o.Kind, o.ResultID, o.Key,
+				o.Window.Start.Format("15:04:05"), o.Window.End.Format("15:04:05"),
+				o.Value, o.Count, o.ReplacedBy)
+		default:
+			fmt.Printf("seq=%-3d rev=%d %-10s result=%-28s key=%-7s window=[%s,%s) sum=%d count=%d\n",
+				o.Seq, o.Revision, o.Kind, o.ResultID, o.Key,
+				o.Window.Start.Format("15:04:05"), o.Window.End.Format("15:04:05"),
+				o.Value, o.Count)
+		}
 	}
 	if sides := dst.Sides(); len(sides) > 0 {
 		fmt.Println("\n===== 旁路记录（迟到/异常，未静默丢弃）=====")

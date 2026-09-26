@@ -83,7 +83,17 @@ func (e *Engine) trigger(ctx context.Context, dst sink.Sink) error {
 			continue
 		}
 
+		// 撤销先于替代结果：会话合并排入 Pending 的、已不再成立的
+		// 旧结果逐条显式撤销，再发出当前存活结果。两者处于同一屏障，
+		// 顺序只由 ResultID 决定，与并发度/到达顺序无关。
+		if len(en.Pending) > 0 {
+			if err := e.emitRetractions(ctx, dst, k, en, now, curWm); err != nil {
+				return err
+			}
+		}
+
 		out := aggregate.Output{
+			ResultID:  resultIDOfKey(k),
 			Revision:  revision,
 			Kind:      kind,
 			Key:       k.Group,

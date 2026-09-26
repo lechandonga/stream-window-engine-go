@@ -1,5 +1,5 @@
 // Package engine 编排事件摄取、窗口分配、水位线推进、窗口触发、
-// 去重、迟到修正、检查点与恢复。
+// 去重、迟到修正、结果撤销、检查点与恢复。
 //
 // 确定性保证：
 //   - 事件处理分两阶段：先在主循环按源顺序完成时间分类与水位线观测
@@ -9,6 +9,10 @@
 //     按 (Group, Window.Start, Window.End, Seq) 确定性顺序统一触发，
 //     因此并发执行与串行执行产生完全相同的输出序列；
 //   - 输出 Seq 在引擎内单调分配，同序重放输入必得同序输出；
+//   - 每个逻辑结果有稳定标识 ResultID（见 resultid.go）：迟到数据
+//     使已发布会话被合并时，先按 ResultID 顺序发出被撤销结果的
+//     RETRACT，再发出存活谱系的替代结果；撤销队列随检查点持久化，
+//     恢复后不漏发、不重发、不复活；
 //   - 检查点原子写入，恢复后水位线不回退、已确认输出不重发、
 //     未完成窗口不丢失。
 package engine
@@ -344,6 +348,7 @@ type Stats struct {
 	Duplicates  int64
 	LateHandled int64
 	Rejected    int64
+	Retractions int64
 	Checkpoints int64
 	Spills      int64
 	Watermark   time.Time

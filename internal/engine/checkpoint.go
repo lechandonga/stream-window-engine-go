@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/lechandonga/stream-window-engine-go/internal/checkpoint"
 	"github.com/lechandonga/stream-window-engine-go/internal/sink"
@@ -38,10 +39,12 @@ func (e *Engine) checkpoint(ctx context.Context, dst sink.Sink) error {
 	}
 	for _, se := range entries {
 		var seen []string
+		var seenVals []int64
 		if se.En.Acc != nil {
 			seen = se.En.Acc.SeenIDs()
+			seenVals = se.En.Acc.SeenValues()
 		}
-		snap.Entries = append(snap.Entries, checkpoint.EntrySnapshot{
+		es := checkpoint.EntrySnapshot{
 			Group:    se.K.Group,
 			Kind:     int(se.K.Win.Kind),
 			Start:    se.K.Win.Start,
@@ -53,7 +56,23 @@ func (e *Engine) checkpoint(ctx context.Context, dst sink.Sink) error {
 			Emitted:  se.En.Emitted,
 			Closed:   se.En.Closed,
 			SeenIDs:  seen,
-		})
+			// 与 SeenIDs 同序，确保恢复后 Value 可正确重算。
+			SeenValues:   seenVals,
+			MaxEventNano: se.En.MaxEvent.UnixNano(),
+		}
+		for _, r := range se.En.Pending {
+			es.Pending = append(es.Pending, checkpoint.RetractionSnapshot{
+				ResultID: r.ResultID,
+				Revision: r.Revision,
+				Start:    r.Win.Start,
+				End:      r.Win.End,
+				Seq:      r.Win.Seq,
+				Value:    r.Value,
+				Count:    r.Count,
+				Late:     r.Late,
+			})
+		}
+		snap.Entries = append(snap.Entries, es)
 	}
 	snap.SpillFiles = e.store.SpillFiles()
 
@@ -87,7 +106,7 @@ func (e *Engine) Restore(ctx context.Context, cs checkpoint.Store, dst sink.Sink
 		acc := aggregateNew(e.cfg.Aggregator)
 		acc.Value = es.Value
 		acc.Count = es.Count
-		acc.LoadSeen(es.SeenIDs)
+		acc.LoadSeen(es.SeenIDs, es.SeenValues)
 		w := window.Window{
 			Kind:  window.Kind(es.Kind),
 			Start: es.Start,
@@ -97,11 +116,28 @@ func (e *Engine) Restore(ctx context.Context, cs checkpoint.Store, dst sink.Sink
 		if w.Kind == window.Session && es.Seq > maxSessionSeq {
 			maxSessionSeq = es.Seq
 		}
+		var pending []state.Retraction
+		for _, r := range es.Pending {
+			pending = append(pending, state.Retraction{
+				ResultID: r.ResultID,
+				Revision: r.Revision,
+				Win:      window.Window{Kind: window.Kind(es.Kind), Start: r.Start, End: r.End, Seq: r.Seq},
+				Value:    r.Value,
+				Count:    r.Count,
+				Late:     r.Late,
+			})
+		}
+		var maxEvent time.Time
+		if es.MaxEventNano != 0 {
+			maxEvent = time.Unix(0, es.MaxEventNano)
+		}
 		entries = append(entries, state.SnapshotEntry{
 			K: state.Key{Group: es.Group, Win: w},
 			En: state.Entry{
 				Acc: acc, Revision: es.Revision,
 				Emitted: es.Emitted, Closed: es.Closed,
+				MaxEvent: maxEvent,
+				Pending:  pending,
 			},
 		})
 	}

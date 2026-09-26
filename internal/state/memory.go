@@ -489,7 +489,7 @@ func (s *memoryStore) RestoreEntries(ctx context.Context, entries []SnapshotEntr
 		if en.Acc == nil {
 			en.Acc = aggregate.NewAccumulator()
 		} else if en.Acc.Seen == nil {
-			en.Acc.Seen = map[string]struct{}{}
+			en.Acc.Seen = map[string]int64{}
 		}
 		if s.cfg.MaxActiveKeys > 0 && len(s.data) >= s.cfg.MaxActiveKeys {
 			if s.cfg.Overflow == OverflowSpill {

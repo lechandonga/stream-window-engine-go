@@ -20,10 +20,17 @@
 |---|---|---|
 | 滚动 Tumbling | `Size` | 事件恰好属于 1 个窗口 |
 | 滑动 Sliding | `Size` + `Slide` | 事件可同时属于多个窗口（`Size/Slide` 个） |
-| 会话 Session | `Gap` | 初始单事件会话 `[ts, ts+Gap)`，相邻间隔 `<= Gap` 的会话确定地合并 |
+| 会话 Session | `Gap` | 初始单事件会话 `[ts, ts+Gap)`，按事件点间隔 `<= Gap` 确定地合并 |
 
 会话合并规则与输入顺序无关：按 `Start`（再按 `End`、`Seq`）排序后聚类，
-合并区间取并、`Seq` 取成员最小值，因此任何重放都得到相同会话。
+连接判定基于**会话内最近一次事件时间**：
+
+- 相邻两个会话的事件点间隔（后一个的最早事件 − 前一个的最晚事件）
+  **恰好等于 `Gap` 时算同一个会话**；严格大于 `Gap` 时分裂为两个独立会话；
+- 合并后窗口 `End = 最晚事件时间 + Gap`，`Seq` 取成员最小值（身份稳定），
+  因此任何到达顺序、任何重放都得到相同会话；
+- 若被合并的会话此前已发布，引擎先对其发出 `RETRACT` 再发出合并结果
+  （见第 3 节）。
 
 ### 异常时间事件（绝不静默丢弃）
 
@@ -69,18 +76,68 @@ W = maxObservedEventTime - Lag
 
 ---
 
-## 3. 输出语义：新增与修正
+## 3. 输出语义：新增、修正与撤销
 
-每个 `(Key, Window)` 的结果带：
+每条输出都带：
 
-- `Seq`：引擎内全局单调递增的**幂等键**，sink 按 `Seq` 去重，
+- `Seq`：引擎内全局单调递增的**投递幂等键**，sink 按 `Seq` 去重，
   重复投递（含重启重放）不会产生重复结果；
-- `Revision`：同一窗口的修订号，首版 `1`，每次迟到修正 `+1`；
-- `Kind`：`INSERT`（首次）或 `CORRECTION`（迟到导致的修正），下游可明确区分；
+- `ResultID`：**逻辑结果的稳定标识**，只依赖数据，与运行次数、并发度、
+  是否中断恢复无关（见下）；
+- `Revision`：同一 `ResultID` 的修订号，首版 `1`，每次迟到修正 `+1`；
+- `Kind`：`INSERT`（首次）、`CORRECTION`（迟到修正）、`RETRACT`（撤销）；
+- `ReplacedBy`：仅 `RETRACT` 使用，指向取代被撤销结果的当前结果；
 - `Late`、`Watermark`、`EmitAt`：解释这次输出由什么触发。
 
+### ResultID：逻辑结果的稳定标识
+
+| 窗口类型 | ResultID 身份 |
+|---|---|
+| 滚动/滑动 | 分组键 + 窗口类型 + 固定窗口边界 `[Start,End)` |
+| 会话 | 分组键 + 会话内**最早事件时间**（谱系起点） |
+
+会话被迟到事件延长末端、或与其他会话合并时，其最早事件时间不变，
+因此同一会话谱系的 `INSERT → CORRECTION → （可能）RETRACT` 由同一个
+`ResultID` 串起来；重放、调整并发度、从检查点续跑都不会改变它。
+
+### RETRACT：已发布结果被撤销
+
+当一条**此前已发布**的结果随着迟到数据到达而不再成立时（典型场景：
+两个已分别发布的会话被一条迟到事件连成同一个会话），引擎在发出
+替代结果**之前**先发出一条 `RETRACT`：
+
+- `ResultID` + `Revision` 精确指向被撤销的那条已发布结果
+  （`Value`/`Count`/`Window` 携带其最后发布时的快照）；
+- `ReplacedBy` 指向当前真正成立的结果（存活谱系的 `ResultID`）；
+- 撤销与替代结果在**同一屏障**内先后发出，顺序确定；
+- 撤销按 `ResultID` 排序后发出，与并发度、到达顺序无关。
+
+**下游对账方式**（维护「分组+窗口」增量视图）：
+
+```
+INSERT/CORRECTION:  view[ResultID] = 当前值        // upsert，按 Revision 判新旧
+RETRACT:            delete(view, ResultID)         // 仅当持有版本 == 消息 Revision
+```
+
+- 幂等：重复投递由 `Seq` 去重；下游再按 `(ResultID, Revision)` 校验，
+  重复撤销、重启重放、并发处理都不会重复撤销，也不会撤销仍有效的结果；
+- 被撤销的 `ResultID` 不会复活：能连接到已清理会话的迟到事件必然超出
+  允许迟到宽限而被丢弃（旁路记录），因此旧谱系不会被再次修正；
+- 撤销元数据有界：待发撤销只挂在存活会话条目上、随触发即发出并清空，
+  随检查点持久化，窗口清理（Purge）时一并消失，不随运行时间增长。
+
+### 与既有 INSERT/CORRECTION 的关系
+
+- 滚动/滑动窗口语义完全不变：只产生 `INSERT`/`CORRECTION`，永不产生
+  `RETRACT`（固定窗口不会因迟到数据消失）；
+- 会话窗口的 `INSERT`/`CORRECTION` 语义不变：迟到延长会话仍是同
+  `ResultID` 的 `CORRECTION`；只有当迟到数据把**多个已发布会话合并**
+  时，被并入的旧会话才收到 `RETRACT`；
+- 既有配置项、输入数据格式、旁路记录格式均不变；输出 JSON 仅新增
+  `result_id`/`replaced_by` 字段（旧字段含义不变），旧下游可安全忽略。
+
 重复事件由窗口累加器按**事件 ID** 去重：同一 ID 二次进入不重复计数，
-也不会造成重复修正。
+也不会造成重复修正或重复撤销（会话合并同样按事件 ID 去重）。
 
 ---
 
@@ -107,8 +164,9 @@ W = maxObservedEventTime - Lag
 - 检查点文件 `chk.json`：魔数 + 紧凑 JSON 载荷 + **SHA-256 校验和**；
 - 写入是原子的：写临时文件 → `fsync` → `rename`。中途失败不产生半成品，
   旧快照始终有效；
-- 快照内容：水位线、`NextSeq`、源偏移、全部窗口累加状态（含去重 ID 集合）、
-  修订号、关闭/脏标记、落盘文件清单；
+- 快照内容：水位线、`NextSeq`、源偏移、全部窗口累加状态（含去重 ID 集合
+  及其 Value、会话最晚事件时间）、修订号、关闭/脏标记、**待发撤销队列**、
+  落盘文件清单；
 - 恢复规则：
   - 无检查点 → 冷启动；
   - 魔数/JSON/校验和/版本任一不符 → 返回 `checkpoint.ErrCorrupt`，
@@ -182,6 +240,15 @@ go vet ./...
 | 窗口边界/归属确定性 | `window/window_test.go` |
 | 水位线单调不回退 | `watermark/watermark_test.go` |
 | 乱序聚合、INSERT/CORRECTION | `engine.TestOutOfOrderTumbling`、`TestLatePolicies` |
+| 迟到合并撤销已发布结果 | `engine.TestLateMergeRetractsPublishedResult`、`TestResultLifecycleSingleLineage` |
+| 会话间隔边界（==Gap 合并 / >Gap 分裂） | `engine.TestSessionGapBoundaryMergeAndSplit` |
+| 级联合并撤销全部旧会话 | `engine.TestCascadeMergeRetractsAllAbsorbed` |
+| 撤销序列跨并发一致 | `engine.TestRetractionSequenceConcurrencyInvariant`（-race） |
+| 重启/重放后撤销不重不漏 | `engine.TestRetractionAcrossRestart`、`TestRetractionRestartAfterRetractEmitted` |
+| 撤销幂等消费、合并去重 | `engine.TestRetractionIdempotentConsumption`、`TestMergedSessionLateDuplicateNotDoubleCounted` |
+| 内存上限下撤销一致、元数据有界 | `engine.TestRetractionUnderMemoryLimit`、`TestRetractionMetadataBounded` |
+| ResultID 规则与稳定性 | `engine.TestResultIDRules`、`TestResultIDStableForTumblingAndSliding` |
+| 合并按事件 ID 去重 | `aggregate.TestAccumulatorMergeIntoDedup` |
 | 滑动/会话窗口 | `engine.TestSlidingWindow`、`TestSessionWindowOrderIndependent` |
 | 重复投递幂等 | `aggregate.TestAccumulatorDedup`、`engine.TestDuplicateRedelivery`、`sink/*` |
 | 重放序列一致 | `engine.TestReplayDeterminism`、`source.TestReplayFromOffsetIdentical` |
@@ -218,7 +285,7 @@ internal/
   event/       事件、异常时间与迟到策略、判定记录
   window/      滚动/滑动/会话窗口分配与确定性合并
   watermark/   单调水位线与有界乱序生成器
-  aggregate/   聚合器、窗口累加状态（事件去重）、INSERT/CORRECTION 输出
+  aggregate/   聚合器、窗口累加状态（事件去重）、INSERT/CORRECTION/RETRACT 输出
   state/       有界状态存储（LRU、背压、落盘、确定性遍历、快照/恢复）
   checkpoint/  原子检查点（魔数+校验和、损坏检测）
   source/      可中断、可回放、带偏移量的内存事件源
