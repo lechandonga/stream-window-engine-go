@@ -44,9 +44,10 @@ func main() {
 		// 输出序列中出现 RETRACT（撤销）+ 替代 INSERT。
 		events = []event.Event{
 			{ID: "s1", Key: "room-A", Ts: at(0), Value: 10},
-			{ID: "s2", Key: "room-A", Ts: at(12), Value: 20},
-			{ID: "adv", Key: "room-A", Ts: at(40), Value: 0},   // 推进水位线：发布两个会话
-			{ID: "bridge", Key: "room-A", Ts: at(6), Value: 5}, // 迟到桥接：合并两个会话
+			{ID: "s2", Key: "room-A", Ts: at(8), Value: 20},     // 与 s1 事件差 8>5：独立会话
+			{ID: "adv", Key: "room-A", Ts: at(40), Value: 0},    // 推进水位线：发布两个会话
+			{ID: "bridge", Key: "room-A", Ts: at(3), Value: 5},  // 迟到桥接：相邻差均恰为 5
+			{ID: "lonely", Key: "room-A", Ts: at(20), Value: 7}, // 迟到但与末事件 8 差 12>5：独立，不撤销
 		}
 		cfg = engine.Config{
 			Window:          window.Spec{Kind: window.Session, Gap: 5 * time.Second},

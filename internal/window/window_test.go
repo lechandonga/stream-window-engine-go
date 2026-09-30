@@ -79,17 +79,37 @@ func TestMergeSessionsOrderIndependent(t *testing.T) {
 		}
 	}
 	// [0,3) 与 [3,6) 间隔 0 <= gap -> 合并为 [0,6)，Seq 取最小值 1。
-	if ma[0].Start.Unix() != 0 || ma[0].End.Unix() != 6 || ma[0].Seq != 1 {
+	// 会话 Seq 恒为 0（标识只由区间决定，与到达顺序无关）。
+	if ma[0].Start.Unix() != 0 || ma[0].End.Unix() != 6 || ma[0].Seq != 0 {
 		t.Fatalf("unexpected merged cluster: %+v", ma[0])
 	}
 	// [0,6) 与 [10,13) 间隔 4s > 2s，独立；[20,22) 同样独立。
 	if len(ma) != 3 {
 		t.Fatalf("expected 3 clusters, got %d: %+v", len(ma), ma)
 	}
-	// 恰好间隔等于 gap（[10,13) 与 [15,18) 间隔 2s）应当合并。
-	touch := MergeSessions([]Window{mk(10, 13, 1), mk(15, 18, 2)}, gap)
-	if len(touch) != 1 || touch[0].Start.Unix() != 10 || touch[0].End.Unix() != 18 {
-		t.Fatalf("gap-touching sessions should merge, got %+v", touch)
+	// 初始会话为 [ts, ts+gap)：[10,13) 与 [13,16) 首尾相接，
+	// 对应相邻事件时间差恰好等于 gap=2s，必须合并。
+	touch := MergeSessions([]Window{mk(10, 13, 1), mk(13, 16, 2)}, gap)
+	if len(touch) != 1 || touch[0].Start.Unix() != 10 || touch[0].End.Unix() != 16 {
+		t.Fatalf("event delta exactly == gap should merge, got %+v", touch)
+	}
+	// 经典旧口径（窗口空隙 == gap）在新语义下必须独立：
+	// [10,13) 与 [15,18) 对应事件差 5s > gap=2s。
+	old := MergeSessions([]Window{mk(10, 13, 1), mk(15, 18, 2)}, gap)
+	if len(old) != 2 {
+		t.Fatalf("event delta 5s > gap 2s must stay separate, got %+v", old)
+	}
+	// 纳秒边界：事件时间差 = gap 恰好合并；gap+1ns 必须独立。
+	mkN := func(ts time.Duration, g time.Duration, seq int64) Window {
+		start := time.Unix(0, int64(ts))
+		return Window{Kind: Session, Start: start, End: start.Add(g), Seq: seq}
+	}
+	gapN := 2 * time.Second
+	if got := MergeSessions([]Window{mkN(0, gapN, 1), mkN(gapN, gapN, 2)}, gapN); len(got) != 1 {
+		t.Fatalf("delta == gap must merge, got %+v", got)
+	}
+	if got := MergeSessions([]Window{mkN(0, gapN, 1), mkN(gapN+time.Nanosecond, gapN, 2)}, gapN); len(got) != 2 {
+		t.Fatalf("delta == gap+1ns must stay separate, got %+v", got)
 	}
 }
 

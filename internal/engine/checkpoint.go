@@ -95,8 +95,13 @@ func (e *Engine) Restore(ctx context.Context, cs checkpoint.Store, dst sink.Sink
 			End:   es.End,
 			Seq:   es.Seq,
 		}
-		if w.Kind == window.Session && es.Seq > maxSessionSeq {
-			maxSessionSeq = es.Seq
+		if w.Kind == window.Session {
+			// 会话标识只由 (分组, 区间) 决定：归一化旧快照中按到达
+			// 顺序分配的非零 Seq，保证续跑与全新重放标识一致。
+			if es.Seq > maxSessionSeq {
+				maxSessionSeq = es.Seq
+			}
+			w.Seq = 0
 		}
 		entries = append(entries, state.SnapshotEntry{
 			K: state.Key{Group: es.Group, Win: w},

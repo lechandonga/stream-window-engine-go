@@ -14,8 +14,9 @@ import (
 // applySession 把事件写入会话窗口，并与同组中可合并的活动会话合并。
 // 合并规则只取决于时间区间与 Gap，与到达顺序无关；
 // 一个事件初始只属于一个会话，因此不同成员的去重集合互不相交。
-// sessSeq 在串行预处理阶段分配，保证同一事件的初始会话标识确定。
-func (e *Engine) applySession(ctx context.Context, k state.Key, ev event.Event, late bool, sessSeq int64) error {
+// 会话窗口标识只由 (分组, Start, End) 决定：Window.Seq 恒为 0，
+// 因此同一批事件以任意顺序到达、任意并发度、任意重放都得到相同标识。
+func (e *Engine) applySession(ctx context.Context, k state.Key, ev event.Event, late bool) error {
 	e.mu.Lock()
 	aggName := e.cfg.Aggregator
 	gap := e.cfg.Window.Gap
@@ -46,7 +47,7 @@ func (e *Engine) applySession(ctx context.Context, k state.Key, ev event.Event, 
 		}
 	}
 
-	k.Win.Seq = sessSeq
+	k.Win.Seq = 0
 	en, err := e.store.GetOrCreate(ctx, k, aggName)
 	if err != nil {
 		return err
@@ -105,11 +106,13 @@ func clusterSessions(keys []state.Key, gap time.Duration) []sessionCluster {
 		if !a.End.Equal(b.End) {
 			return a.End.Before(b.End)
 		}
-		return a.Seq < b.Seq
+		return a.Seq < b.Seq // 恒为 0，仅保持稳定排序
 	})
 	var clusters []sessionCluster
 	for _, k := range sorted {
-		if len(clusters) == 0 || clusters[len(clusters)-1].win.End.UnixNano()+int64(gap) < k.Win.Start.UnixNano() {
+		// 初始会话为 [ts, ts+gap)：prev.End >= cur.Start 恰好等价于
+		// 相邻事件时间差 <= gap。等于 gap 合并，超过 gap（含 1ns）独立。
+		if len(clusters) == 0 || clusters[len(clusters)-1].win.End.UnixNano() < k.Win.Start.UnixNano() {
 			clusters = append(clusters, sessionCluster{win: k.Win, members: []state.Key{k}})
 			continue
 		}
@@ -118,9 +121,7 @@ func clusterSessions(keys []state.Key, gap time.Duration) []sessionCluster {
 		if k.Win.End.After(c.win.End) {
 			c.win.End = k.Win.End
 		}
-		if k.Win.Seq < c.win.Seq {
-			c.win.Seq = k.Win.Seq
-		}
+		c.win.Seq = 0 // 会话标识与到达顺序无关
 	}
 	return clusters
 }

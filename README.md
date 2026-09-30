@@ -22,10 +22,21 @@
 |---|---|---|
 | 滚动 Tumbling | `Size` | 事件恰好属于 1 个窗口 |
 | 滑动 Sliding | `Size` + `Slide` | 事件可同时属于多个窗口（`Size/Slide` 个） |
-| 会话 Session | `Gap` | 初始单事件会话 `[ts, ts+Gap)`，相邻间隔 `<= Gap` 的会话确定地合并 |
+| 会话 Session | `Gap` | 初始单事件会话 `[ts, ts+Gap)`，相邻**事件时间差** `<= Gap` 确定地合并 |
 
-会话合并规则与输入顺序无关：按 `Start`（再按 `End`、`Seq`）排序后聚类，
-合并区间取并、`Seq` 取成员最小值，因此任何重放都得到相同会话。
+会话边界只由相邻事件的时间差与 `Gap` 决定，与此前发生过几轮合并、
+事件到达顺序、前一个会话是否已发布结果均无关：
+
+- 时间差 **恰好等于** `Gap` → **同一个会话**（初始窗 `[ts, ts+Gap)`
+  首尾相接，例如 `Gap=10s` 时事件在 0s 与 10s 合并为 `[0,20)` 形态）；
+- 时间差 **超过** `Gap`，哪怕只超 1ns → **两个独立会话**
+  （`Gap=10s` 时 0s 与 11s 是 `[0,10)`、`[11,21)` 两个会话；
+  0s、10s、30s 三条是 `[0,20)` 与 `[30,40)` 两个会话）。
+
+合并规则与输入顺序无关：按 `Start`（再按 `End`）排序后聚类，合并区间
+取并。会话窗口标识只由「分组 + `[Start,End)`」决定（窗口 `Seq` 恒为 0），
+因此同一批事件以任意顺序到达、任意并发度、中断续跑或整批重放，
+都会得到相同的会话与相同的 `ResultID`。
 
 ### 异常时间事件（绝不静默丢弃）
 
@@ -89,20 +100,29 @@ W = maxObservedEventTime - Lag
 
 ### 撤销（RETRACT）：已发布结果被收回
 
-会话窗口可能随（迟到）数据继续合并：两个已经分别发布过的会话，
-会被一条迟到事件桥接成同一个更大的会话。此时旧标识的结果**不再成立**，
-引擎在同一屏障内、替代结果**之前**发出 `RETRACT`：
+会话窗口可能随（迟到）数据继续合并。只有当一条（或一批）迟到事件
+**确实把两个已发布会话桥接成同一个会话**——桥接链路里每一段相邻事件
+时间差都 `<= Gap`——时，旧标识的结果才**不再成立**：引擎在同一屏障内、
+替代结果**之前**发出 `RETRACT`。若迟到事件与已发布会话的相邻间隔
+`> Gap`，已发布结果依然有效，**不发撤销**；迟到事件按自己的会话
+正常 `INSERT`，下游视图里两个会话各占一行。
+
+桥接示例（`Gap=5s`，事件 0s、8s 先分别发布，迟到事件 3s 把两者桥接，
+相邻差 3s、5s 均 `<= 5s`；另有 20s 迟到事件与末事件 8s 差 12s `> 5s`，
+独立发布、不撤销任何结果）：
 
 ```
-seq=3 RETRACT key=room-A window=[00,05) rev=1 replaced_by=room-A|session:...:17...:1
-seq=4 RETRACT key=room-A window=[12,17) rev=1 replaced_by=room-A|session:...:17...:1
-seq=5 INSERT  key=room-A window=[00,17) rev=1            ← 替代结果（新标识）
+seq=3 RETRACT key=room-A window=[00:00:00,00:00:05) rev=1 replaced_by=...session:...:13...
+seq=4 RETRACT key=room-A window=[00:00:08,00:00:13) rev=1 replaced_by=...session:...:13...
+seq=5 INSERT  key=room-A window=[00:00:00,00:00:13) rev=1  ← 替代结果（仅含 0s/3s/8s）
+seq=6 INSERT  key=room-A window=[00:00:20,00:00:25) rev=1  ← 超 Gap 的迟到事件，独立一行
 ```
 
 - `RETRACT` 记录精确携带被撤销结果的 `ResultID`、被撤销时的
   `Revision`/`Value`/`Count`，以及替代结果的 `ResultID`（`ReplacedBy`），
   下游不需要自己猜旧结果是否还有效；
-- 替代结果是**新标识**的 `INSERT rev=1`（每个标识有独立生命周期：
+- 替代结果是**新标识**的 `INSERT rev=1`，窗口起止/求和/计数只包含
+  真正属于该会话的事件，不会把本应独立的另一个会话算进来（每个标识有独立生命周期：
   `INSERT → CORRECTION… → RETRACT`）；
 - 若迟到事件并入后窗口标识不变（新区间被既有会话完全覆盖），
   则走 `CORRECTION`，不产生撤销；
@@ -120,7 +140,7 @@ seq=5 INSERT  key=room-A window=[00,17) rev=1            ← 替代结果（新�
 由此：重复投递、重启重放、并发处理都不会让下游重复撤销，
 也不会撤销掉仍然有效的结果（被撤标识精确匹配，且会话合并单调、
 被撤标识不会复活）。撤销判定发生在会话合并时，发射统一在屏障点按
-`(Group, Window.Start, End, Seq)` 排序进行，因此撤销序列同样与
+`(Group, Window.Start, End)` 排序进行，因此撤销序列同样与
 并发度、重放次数、中断续跑无关。待撤销信息是屏障内瞬时状态
 （发射即清空），不进检查点、不随运行时间增长；崩溃后随状态回退与
 输入重放被等价重建，配合 `Seq` 幂等保证不重复、不遗漏。
@@ -132,11 +152,11 @@ seq=5 INSERT  key=room-A window=[00,17) rev=1            ← 替代结果（新�
 处理以**屏障批次**进行（大小 = `min(32, CheckpointEvery)`）：
 
 1. **预处理阶段（按源顺序，串行）**：时间异常分类、观测事件时间、冻结批水位线；
-   会话窗口的窗口序号（`Window.Seq`）也在此阶段分配——同一事件在任何
-   并发度、任何重放下得到相同序号，会话窗口标识（及 `ResultID`）因此稳定；
+   会话窗口标识只由分组与窗口区间决定（`Window.Seq` 恒为 0），
+   不依赖到达顺序，会话窗口标识（及 `ResultID`）因此稳定；
 2. **写入阶段（屏障内并发）**：事件按分组键 FNV 哈希分片到 `Concurrency`
    个 worker，同键事件永远在同一 worker 保序；会话合并按分组键互斥；
-3. **触发阶段（屏障点）**：先按 `(Group, Window.Start, End, Seq)` 确定性顺序
+3. **触发阶段（屏障点）**：先按 `(Group, Window.Start, End)` 确定性顺序
    发射本屏障的撤销（RETRACT），再以同样确定性键序触发窗口、分配 `Seq`。
 
 因此：**并发执行与串行执行的输出序列逐字节一致**（有
@@ -153,9 +173,9 @@ seq=5 INSERT  key=room-A window=[00,17) rev=1            ← 替代结果（新�
 - 检查点文件 `chk.json`：魔数 + 紧凑 JSON 载荷 + **SHA-256 校验和**；
 - 写入是原子的：写临时文件 → `fsync` → `rename`。中途失败不产生半成品，
   旧快照始终有效；
-- 快照内容：水位线、`NextSeq`、**会话序号计数器（`SessionSeq`，保证
-  重放后会话窗口标识不漂移；旧快照缺该字段时从存活条目反推，向前兼容）**、
-  源偏移、全部窗口累加状态（含去重 ID 集合）、修订号、关闭/脏标记、落盘文件清单；
+- 快照内容：水位线、`NextSeq`、`SessionSeq` 计数器（字段保留以兼容
+  旧快照；会话标识现已不依赖它，窗口 `Seq` 恒为 0）、源偏移、全部窗口
+  累加状态（含去重 ID 集合）、修订号、关闭/脏标记、落盘文件清单；
 - 恢复规则：
   - 无检查点 → 冷启动；
   - 魔数/JSON/校验和/版本任一不符 → 返回 `checkpoint.ErrCorrupt`，
@@ -218,8 +238,16 @@ seq=5 INSERT  key=room-A window=[00,17) rev=1            ← 替代结果（新�
   既有字段名与含义不变，旧下游可安全忽略新字段；
 - **输出约定**：`INSERT`/`CORRECTION` 语义不变；`RETRACT` 是新增 `Kind`，
   只在「已发布的会话结果被合并掉」时出现——滚动/滑动窗口输出序列完全不变；
-- **检查点**：快照新增 `SessionSeq` 字段；读取旧快照时自动回退兼容，
-  新版本写出的快照不建议用旧版本读取；
+- **检查点**：快照 `SessionSeq` 字段保留并继续读写（旧快照自动回退
+  兼容）；会话窗口标识不再依赖该计数器（`Window.Seq` 恒为 0），
+  但字段与格式保持不变；
+- **行为修复**（会话间隔判定缺陷）：此前合并判定误用
+  `prev.End + Gap >= cur.Start`，实际允许相邻事件时间差达到 `2*Gap`
+  才分裂（如 `Gap=10s` 时 0s 与 11s 被错并）。现修正为按相邻事件时间差
+  判定：`<= Gap`（含恰好相等）合并，`> Gap`（含超 1ns）分裂；
+- **行为修复**（会话标识稳定性缺陷）：会话窗口 `Seq` 此前按事件到达
+  顺序分配，导致同一批数据在不同到达顺序下 `ResultID` 漂移；现会话标识
+  只由分组与窗口区间决定，跨顺序/并发/重放逐条一致；
 - **行为修复**（属于缺陷修复而非语义变更）：会话窗口下同一事件 ID 的
   重复投递/重启重放此前可能被二次计数，现与滚动/滑动窗口一致按 ID 去重。
 
@@ -249,6 +277,8 @@ go vet ./...
 | **撤销序列跨并发度一致（1/2/4/8）** | `engine.TestSessionRetractSameAcrossConcurrency` |
 | **撤销重启/重放不重复不遗漏** | `engine.TestSessionRetractSurvivesRestartAndReplay` |
 | **会话间隔边界（=Gap 合并 / >Gap 分离）** | `engine.TestSessionGapBoundary` |
+| **超 Gap 迟到事件不撤销已发结果（视图各占一行）** | `engine.TestSessionLateBeyondGapNoRetract`（1/2/4/8 并发） |
+| **多轮合并跨顺序/并发收敛** | `engine.TestSessionMultiRoundMergeDeterministic` |
 | **同标识扩展走 CORRECTION 不撤销** | `engine.TestSessionExtensionSameIdentityCorrects` |
 | **会话窗口重复投递去重** | `engine.TestSessionDuplicateRedelivery` |
 | **背压/落盘下撤销完整** | `engine.TestSessionRetractUnderMemoryLimit`、`TestSessionRetractWithSpillAcrossRestart` |
@@ -268,8 +298,10 @@ go vet ./...
 # 完整运行（乱序/迟到/重复/异常时间）
 go run ./cmd/demo -dir /tmp/swe-demo
 
-# 会话窗口撤销演示：两个已发布会话被迟到事件桥接合并，
-# 输出中可见 RETRACT（含 replaced_by）+ 替代 INSERT
+# 会话窗口演示（Gap=5s）：
+# - 0s、8s 两个已发布会话被迟到的 3s 桥接（相邻差 3s、5s <= 5s）：
+#   先两条 RETRACT（含 replaced_by），再发替代 INSERT [00:00:00,00:00:13)
+# - 20s 迟到事件与末事件 8s 差 12s > 5s：不撤销，独立发布 [00:00:20,00:00:25)
 go run ./cmd/demo -dir /tmp/swe-demo-session -session
 
 # 模拟来源中断（退出码 2），已完成屏障均已检查点
