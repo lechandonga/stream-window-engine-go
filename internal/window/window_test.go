@@ -86,10 +86,20 @@ func TestMergeSessionsOrderIndependent(t *testing.T) {
 	if len(ma) != 3 {
 		t.Fatalf("expected 3 clusters, got %d: %+v", len(ma), ma)
 	}
-	// 恰好间隔等于 gap（[10,13) 与 [15,18) 间隔 2s）应当合并。
-	touch := MergeSessions([]Window{mk(10, 13, 1), mk(15, 18, 2)}, gap)
-	if len(touch) != 1 || touch[0].Start.Unix() != 10 || touch[0].End.Unix() != 18 {
+	// 初始会话为 [ts, ts+gap)；两个首尾相接的单事件会话
+	// [10,12) 与 [12,14) 表示相邻事件时间差恰好等于 gap=2s，应当合并。
+	touch := MergeSessions([]Window{mk(10, 12, 1), mk(12, 14, 2)}, gap)
+	if len(touch) != 1 || touch[0].Start.Unix() != 10 || touch[0].End.Unix() != 14 {
 		t.Fatalf("gap-touching sessions should merge, got %+v", touch)
+	}
+	// 超过 gap 1ns 也必须独立：[10,12) 与 [12.000000001, 14.000000001)。
+	t1 := time.Unix(10, 0)
+	over := MergeSessions([]Window{
+		{Kind: Session, Start: t1, End: t1.Add(gap), Seq: 1},
+		{Kind: Session, Start: t1.Add(gap + time.Nanosecond), End: t1.Add(2*gap + time.Nanosecond), Seq: 2},
+	}, gap)
+	if len(over) != 2 {
+		t.Fatalf("gap exceeded by 1ns must split sessions, got %+v", over)
 	}
 }
 

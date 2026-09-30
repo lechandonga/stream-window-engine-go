@@ -57,9 +57,9 @@ func TestSessionMergeRetractsPublishedResults(t *testing.T) {
 	cfg := sessionCfg(event.LateInclude)
 	events := []event.Event{
 		eid("e1", "k", 0, 1),     // 会话 S1=[0,5)
-		eid("e2", "k", 12, 2),    // 会话 S2=[12,17)（间隔 7>5，独立）
+		eid("e2", "k", 9, 2),     // 会话 S2=[9,14)（间隔 9>5，独立）
 		eid("adv", "k", 40, 0),   // 水位线到 40：S1、S2 先后发布
-		eid("bridge", "k", 6, 4), // 迟到桥接：[6,11) 把 S1、S2 并成 [0,17)
+		eid("bridge", "k", 4, 4), // 迟到桥接：[4,9) 与两侧间隔均 <=5，把 S1、S2 并成 [0,14)
 	}
 	e := quietEngine(t, cfg)
 	dst := sink.NewMemory()
@@ -75,7 +75,7 @@ func TestSessionMergeRetractsPublishedResults(t *testing.T) {
 	want := []aggregate.OutputKind{
 		aggregate.Insert, aggregate.Insert, // S1、S2 首次发布
 		aggregate.Retract, aggregate.Retract, // 撤销 S1、S2
-		aggregate.Insert, // 合并后的 [0,17)
+		aggregate.Insert, // 合并后的 [0,14)
 		aggregate.Insert, // adv 自身的会话 [40,45)
 	}
 	if len(kinds) != len(want) {
@@ -111,8 +111,8 @@ func TestSessionMergeRetractsPublishedResults(t *testing.T) {
 	if merged.Revision != 1 || merged.Value != 7 || merged.Count != 3 {
 		t.Fatalf("merged wrong: %+v", merged)
 	}
-	if !merged.Window.Start.Equal(testBase) || !merged.Window.End.Equal(testBase.Add(17*time.Second)) {
-		t.Fatalf("merged window=[%v,%v) want [0,17)", merged.Window.Start, merged.Window.End)
+	if !merged.Window.Start.Equal(testBase) || !merged.Window.End.Equal(testBase.Add(14*time.Second)) {
+		t.Fatalf("merged window=[%v,%v) want [0,14)", merged.Window.Start, merged.Window.End)
 	}
 
 	// 下游对账：按 Seq 顺序应用后，视图只剩合并会话与 adv 会话，无幽灵。
@@ -155,14 +155,15 @@ func TestSessionRetractSameAcrossConcurrency(t *testing.T) {
 	for _, g := range groups {
 		events = append(events,
 			eid(g+"-e1", g, 0, 1),
-			eid(g+"-e2", g, 12, 2),
+			eid(g+"-e2", g, 9, 2),
 			eid(g+"-adv1", g, 40, 0),
 			eid(g+"-adv2", g, 41, 0),
 		)
 	}
-	// 第二个屏障（收尾残余批次）：每组一条迟到桥接事件，触发撤销+替代。
+	// 第二个屏障（收尾残余批次）：每组一条迟到桥接事件（与两侧间隔均
+	// <=5s），触发撤销+替代。
 	for _, g := range groups {
-		events = append(events, eid(g+"-bridge", g, 6, 4))
+		events = append(events, eid(g+"-bridge", g, 4, 4))
 	}
 	run := func(conc int) []aggregate.Output {
 		cfg := sessionCfg(event.LateInclude)
@@ -214,9 +215,9 @@ func TestSessionRetractSameAcrossConcurrency(t *testing.T) {
 func TestSessionRetractSurvivesRestartAndReplay(t *testing.T) {
 	events := []event.Event{
 		eid("e1", "k", 0, 1),
-		eid("e2", "k", 12, 2),
+		eid("e2", "k", 9, 2),
 		eid("adv", "k", 40, 0),
-		eid("bridge", "k", 6, 4),
+		eid("bridge", "k", 4, 4),
 	}
 	dir := t.TempDir()
 	cfg := func(dir string) Config {
@@ -306,13 +307,14 @@ func TestSessionRetractSurvivesRestartAndReplay(t *testing.T) {
 // 会话合并边界（验收专项）：相邻间隔恰好等于 Gap 必须合并成一个会话；
 // 超过 Gap（哪怕 1ns）必须是两个独立会话。
 func TestSessionGapBoundary(t *testing.T) {
-	run := func(ts2 int64) []aggregate.Output {
+	gapNanos := int64((5 * time.Second) / time.Nanosecond)
+	run := func(deltaNanos int64) []aggregate.Output {
 		cfg := sessionCfg(event.LateInclude)
 		cfg.CheckpointEvery = 3
 		e := quietEngine(t, cfg)
 		events := []event.Event{
 			eid("e1", "k", 0, 1),
-			eid("e2", "k", ts2, 2),
+			{ID: "e2", Key: "k", Ts: testBase.Add(time.Duration(deltaNanos)), Value: 2},
 			eid("adv", "k", 100, 0),
 		}
 		dst := sink.NewMemory()
@@ -321,8 +323,8 @@ func TestSessionGapBoundary(t *testing.T) {
 		}
 		return dst.Outputs()
 	}
-	// [0,5) 与 [10,15)：间隔 5 == Gap=5 → 合并为 [0,15)，仅一个数据会话。
-	equal := run(10)
+	// 事件 0s 与 5s：间隔 5s 恰好 == Gap=5s → 合并为 [0,10)，仅一个数据会话。
+	equal := run(gapNanos)
 	var dataSessions []aggregate.Output
 	for _, o := range equal {
 		// 只统计早于水位线推进事件自身会话（ts=100）的数据窗口。
@@ -333,13 +335,13 @@ func TestSessionGapBoundary(t *testing.T) {
 	if len(dataSessions) != 1 {
 		t.Fatalf("gap exactly: want 1 merged data session, got %d (%+v)", len(dataSessions), equal)
 	}
-	if !dataSessions[0].Window.End.Equal(testBase.Add(15*time.Second)) ||
+	if !dataSessions[0].Window.End.Equal(testBase.Add(10*time.Second)) ||
 		dataSessions[0].Value != 3 || dataSessions[0].Count != 2 {
 		t.Fatalf("merged boundary session wrong: %+v", dataSessions[0])
 	}
 
-	// [0,5) 与 [11,16)：间隔 6 > Gap=5 → 两个独立会话。
-	over := run(11)
+	// 事件 0s 与 5s+1ns：间隔只超过 1ns → 必须是两个独立会话。
+	over := run(gapNanos + 1)
 	dataSessions = dataSessions[:0]
 	for _, o := range over {
 		if o.Kind != aggregate.Retract && o.Window.Start.Before(testBase.Add(20*time.Second)) {
@@ -354,6 +356,53 @@ func TestSessionGapBoundary(t *testing.T) {
 			t.Fatalf("gap exceeded: no retraction expected, got %+v", o)
 		}
 	}
+	// 两个会话各自只含自己的事件：不能把独立会话的事件算进来。
+	first, second := dataSessions[0], dataSessions[1]
+	if !first.Window.Start.Equal(testBase) || !first.Window.End.Equal(testBase.Add(5*time.Second)) ||
+		first.Value != 1 || first.Count != 1 {
+		t.Fatalf("first independent session wrong: %+v", first)
+	}
+	if !second.Window.Start.Equal(testBase.Add(5*time.Second+time.Nanosecond)) ||
+		!second.Window.End.Equal(testBase.Add(10*time.Second+time.Nanosecond)) ||
+		second.Value != 2 || second.Count != 1 {
+		t.Fatalf("second independent session wrong: %+v", second)
+	}
+
+	// 三事件链：0s、5s（恰好上限）必须并入同会话；30s 间隔 25s 独立。
+	chain := func() []aggregate.Output {
+		cfg := sessionCfg(event.LateInclude)
+		cfg.CheckpointEvery = 4
+		e := quietEngine(t, cfg)
+		events := []event.Event{
+			eid("c1", "k", 0, 1),
+			eid("c2", "k", 5, 2),
+			eid("c3", "k", 30, 3),
+			eid("adv", "k", 100, 0),
+		}
+		dst := sink.NewMemory()
+		if err := e.Run(context.Background(), source.NewMemory(events), dst); err != nil {
+			t.Fatal(err)
+		}
+		return dst.Outputs()
+	}()
+	dataSessions = dataSessions[:0]
+	for _, o := range chain {
+		if o.Kind != aggregate.Retract && o.Window.Start.Before(testBase.Add(60*time.Second)) {
+			dataSessions = append(dataSessions, o)
+		}
+	}
+	if len(dataSessions) != 2 {
+		t.Fatalf("chain: want [0,10) and [30,35), got %d: %+v", len(dataSessions), chain)
+	}
+	if !dataSessions[0].Window.End.Equal(testBase.Add(10*time.Second)) ||
+		dataSessions[0].Value != 3 || dataSessions[0].Count != 2 {
+		t.Fatalf("chain merged session wrong: %+v", dataSessions[0])
+	}
+	if !dataSessions[1].Window.Start.Equal(testBase.Add(30*time.Second)) ||
+		!dataSessions[1].Window.End.Equal(testBase.Add(35*time.Second)) ||
+		dataSessions[1].Value != 3 || dataSessions[1].Count != 1 {
+		t.Fatalf("chain independent session wrong: %+v", dataSessions[1])
+	}
 }
 
 // 迟到事件落在已发布会话区间内（合并后窗口标识不变）：
@@ -361,10 +410,10 @@ func TestSessionGapBoundary(t *testing.T) {
 func TestSessionExtensionSameIdentityCorrects(t *testing.T) {
 	cfg := sessionCfg(event.LateInclude)
 	events := []event.Event{
-		eid("e1", "k", 0, 1),  // [0,5)
-		eid("e2", "k", 10, 2), // [10,15)，与 [0,5) 间隔恰好 5 → 合并 [0,15)
+		eid("e1", "k", 0, 1), // [0,5)
+		eid("e2", "k", 5, 2), // [5,10)，与 [0,5) 首尾相接（间隔恰好 5）→ 合并 [0,10)
 		eid("adv", "k", 40, 0),
-		eid("e3", "k", 5, 4), // 迟到，[5,10) 并入后窗口仍是 [0,15)
+		eid("e3", "k", 3, 4), // 迟到，[3,8) 并入后窗口仍是 [0,10)
 	}
 	e := quietEngine(t, cfg)
 	dst := sink.NewMemory()
@@ -391,19 +440,19 @@ func TestSessionExtensionSameIdentityCorrects(t *testing.T) {
 	if corrections != 1 {
 		t.Fatalf("want exactly 1 CORRECTION, got %d: %+v", corrections, out)
 	}
-	if !corrected.Window.Start.Equal(testBase) || !corrected.Window.End.Equal(testBase.Add(15*time.Second)) ||
+	if !corrected.Window.Start.Equal(testBase) || !corrected.Window.End.Equal(testBase.Add(10*time.Second)) ||
 		corrected.Value != 7 || corrected.Count != 3 || corrected.Revision != 2 {
 		t.Fatalf("correction wrong: %+v", corrected)
 	}
 	// [0,15) 首次插入存在（rev1）。
 	found := false
 	for _, o := range out {
-		if o.Kind == aggregate.Insert && o.Window.End.Equal(testBase.Add(15*time.Second)) && o.Revision == 1 {
+		if o.Kind == aggregate.Insert && o.Window.End.Equal(testBase.Add(10*time.Second)) && o.Revision == 1 {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("missing INSERT rev1 for [0,15): %+v", out)
+		t.Fatalf("missing INSERT rev1 for [0,10): %+v", out)
 	}
 }
 
@@ -454,9 +503,9 @@ func TestSessionDuplicateRedelivery(t *testing.T) {
 func TestSessionRetractUnderMemoryLimit(t *testing.T) {
 	events := []event.Event{
 		eid("e1", "k", 0, 1),
-		eid("e2", "k", 12, 2),
+		eid("e2", "k", 9, 2),
 		eid("adv", "k", 40, 0),
-		eid("bridge", "k", 6, 4),
+		eid("bridge", "k", 4, 4),
 	}
 	for _, policy := range []state.OverflowPolicy{state.OverflowSpill, state.OverflowBlock} {
 		t.Run(policyName(policy), func(t *testing.T) {
@@ -483,7 +532,7 @@ func TestSessionRetractUnderMemoryLimit(t *testing.T) {
 				if o.Kind == aggregate.Retract {
 					retracts++
 				}
-				if o.Kind == aggregate.Insert && o.Window.End.Equal(testBase.Add(17*time.Second)) {
+				if o.Kind == aggregate.Insert && o.Window.End.Equal(testBase.Add(14*time.Second)) {
 					merged = o
 				}
 			}
@@ -515,9 +564,9 @@ func TestSessionRetractWithSpillAcrossRestart(t *testing.T) {
 	base := t.TempDir()
 	events := []event.Event{
 		eid("e1", "k", 0, 1),
-		eid("e2", "k", 12, 2),
+		eid("e2", "k", 9, 2),
 		eid("adv", "k", 40, 0),
-		eid("bridge", "k", 6, 4),
+		eid("bridge", "k", 4, 4),
 	}
 	cfg := func() Config {
 		c := sessionCfg(event.LateInclude)
@@ -551,7 +600,7 @@ func TestSessionRetractWithSpillAcrossRestart(t *testing.T) {
 		if o.Kind == aggregate.Retract {
 			retracts++
 		}
-		if o.Kind == aggregate.Insert && o.Window.End.Equal(testBase.Add(17*time.Second)) {
+		if o.Kind == aggregate.Insert && o.Window.End.Equal(testBase.Add(14*time.Second)) {
 			merged = o
 		}
 	}
@@ -575,4 +624,198 @@ func policyName(p state.OverflowPolicy) string {
 		return "spill"
 	}
 	return "block"
+}
+
+// 验收：前一个会话已经发布过结果，然后来一条超过上限的迟到事件。
+// 已发布结果依然成立：不得对它发撤销；迟到事件按自己的会话正常发布
+// 一份结果，下游视图里两个会话各占一行（无幽灵、不丢有效行）。
+func TestSessionLateEventBeyondGapKeepsPublishedRow(t *testing.T) {
+	gap := 5 * time.Second
+	run := func(lateTsSec int64, lateTsNanoseconds int) ([]aggregate.Output, *Engine) {
+		cfg := sessionCfg(event.LateInclude)
+		cfg.Window.Gap = gap
+		cfg.CheckpointEvery = 3
+		e := quietEngine(t, cfg)
+		events := []event.Event{
+			eid("e1", "k", 0, 1),
+			eid("adv", "k", 20, 0), // 发布 [0,5)（水位线 20，迟到仍在宽限期内）
+			{ID: "late", Key: "k",
+				Ts:    testBase.Add(time.Duration(lateTsSec)*time.Second + time.Duration(lateTsNanoseconds)),
+				Value: 9},
+		}
+		dst := sink.NewMemory()
+		if err := e.Run(context.Background(), source.NewMemory(events), dst); err != nil {
+			t.Fatal(err)
+		}
+		return dst.Outputs(), e
+	}
+
+	// 刚超过上限 1ns（迟到首事件 5s+1ns）：两个独立会话，零撤销。
+	out, eng := run(5, 1)
+	var kinds []aggregate.OutputKind
+	for _, o := range out {
+		kinds = append(kinds, o.Kind)
+	}
+	want := []aggregate.OutputKind{
+		aggregate.Insert, // 已发布 [0,5)
+		aggregate.Insert, // adv 会话 [20,25)
+		aggregate.Insert, // 迟到事件自己的会话（5.000000001 起）
+	}
+	if len(kinds) != len(want) {
+		t.Fatalf("outputs=%d want %d: %+v", len(kinds), len(want), out)
+	}
+	for i := range want {
+		if kinds[i] != want[i] {
+			t.Fatalf("output %d kind=%s want %s: %+v", i, kinds[i], want[i], out)
+		}
+	}
+	for _, o := range out {
+		if o.Kind == aggregate.Retract {
+			t.Fatalf("published result beyond gap must not be retracted: %+v", o)
+		}
+	}
+	if eng.Stats().Retractions != 0 {
+		t.Fatalf("retractions stat=%d want 0", eng.Stats().Retractions)
+	}
+	published := out[0]
+	if !published.Window.Start.Equal(testBase) || !published.Window.End.Equal(testBase.Add(gap)) ||
+		published.Value != 1 || published.Count != 1 {
+		t.Fatalf("published session must stay unchanged: %+v", published)
+	}
+	// 输出按窗口起点排序：迟到会话 [5.000000001,…) 在 [0,5) 之后、adv 之前。
+	lateSess := out[1]
+	lateStart := testBase.Add(gap + time.Nanosecond)
+	if !lateSess.Window.Start.Equal(lateStart) || !lateSess.Window.End.Equal(lateStart.Add(gap)) ||
+		lateSess.Value != 9 || lateSess.Count != 1 {
+		t.Fatalf("late event must publish its own clean session: %+v", lateSess)
+	}
+
+	// 下游对账：视图三行（[0,5)、迟到会话、adv 会话），已发布行原封不动。
+	v := newView()
+	for _, o := range out {
+		v.apply(o)
+	}
+	if len(v.rows) != 3 {
+		t.Fatalf("view rows=%d want 3: %+v", len(v.rows), v.rows)
+	}
+	if row, ok := v.rows[published.ResultID]; !ok || row.Value != 1 || row.Count != 1 {
+		t.Fatalf("valid published row lost or altered: ok=%v row=%+v", ok, row)
+	}
+	if row := v.rows[lateSess.ResultID]; row.Value != 9 || row.Count != 1 {
+		t.Fatalf("late session row wrong: %+v", row)
+	}
+
+	// 间隔恰好等于上限（迟到首事件 5s）：迟到事件必须并入已发布会话，
+	// 不产生撤销、不新增独立行；（逐事件屏障下合并发生在首次发布前，
+	// 因此以单一合并会话 [0,10) 的 INSERT 呈现；延迟发布时则为
+	// CORRECTION，两种呈现都不允许出现撤销——详见 TestSessionExtensionSameIdentityCorrects。）
+	equal, _ := run(5, 0)
+	var retracts int
+	var data []aggregate.Output
+	for _, o := range equal {
+		if o.Kind == aggregate.Retract {
+			retracts++
+		}
+		if o.Window.Start.Before(testBase.Add(10 * time.Second)) {
+			data = append(data, o)
+		}
+	}
+	if retracts != 0 {
+		t.Fatalf("gap exactly equal must never retract, got %d: %+v", retracts, equal)
+	}
+	if len(data) != 1 || !data[0].Window.End.Equal(testBase.Add(10*time.Second)) ||
+		data[0].Value != 10 || data[0].Count != 2 {
+		t.Fatalf("gap exactly equal must yield one merged session [0,10) sum=10 count=2, got %+v", equal)
+	}
+}
+
+// 多轮合并：两条迟到桥接分两轮把三个已发布会话串成一个，每一轮都走
+// “先撤销旧标识、再发布新标识”，最终替代结果只包含本会话的事件；
+// 两条桥接以任意顺序到达，撤销总数与最终视图一致（与到达顺序无关）。
+func TestSessionMultiRoundMergeOrderIndependent(t *testing.T) {
+	eventsForward := []event.Event{
+		eid("e1", "k", 0, 1),
+		eid("e2", "k", 9, 2),
+		eid("e3", "k", 18, 3),
+		eid("adv", "k", 60, 0), // 三个独立会话先后发布
+		eid("adv2", "k", 61, 0),
+		eid("b1", "k", 4, 4), // 第一轮：桥接 e1-e2（两侧间隔均 4）
+		eid("adv3", "k", 62, 0),
+		eid("b2", "k", 13, 5), // 第二轮：桥接到 e3（18-13=5，恰好上限）
+	}
+	eventsReverse := []event.Event{
+		eventsForward[0], eventsForward[1], eventsForward[2], eventsForward[3], eventsForward[4],
+		eventsForward[7], // b2 先到
+		eventsForward[6], // adv3
+		eventsForward[5], // b1 后到
+	}
+	run := func(evs []event.Event) []aggregate.Output {
+		cfg := sessionCfg(event.LateInclude)
+		cfg.CheckpointEvery = 1
+		e := quietEngine(t, cfg)
+		dst := sink.NewMemory()
+		if err := e.Run(context.Background(), source.NewMemory(evs), dst); err != nil {
+			t.Fatal(err)
+		}
+		return dst.Outputs()
+	}
+	fwd := run(eventsForward)
+	rev := run(eventsReverse)
+
+	// 最终视图：只剩合并会话 [0,23)（sum=15,count=5）与 adv 会话 [60,65)。
+	finalView := func(out []aggregate.Output) map[string]aggregate.Output {
+		v := newView()
+		for _, o := range out {
+			v.apply(o)
+		}
+		return v.rows
+	}
+	vf, vr := finalView(fwd), finalView(rev)
+	if len(vf) != 2 || len(vr) != 2 {
+		t.Fatalf("final rows fwd=%d rev=%d", len(vf), len(vr))
+	}
+	var merged aggregate.Output
+	for _, o := range vf {
+		if o.Window.Start.Equal(testBase) {
+			merged = o
+		}
+	}
+	if !merged.Window.End.Equal(testBase.Add(23*time.Second)) ||
+		merged.Value != 15 || merged.Count != 5 {
+		t.Fatalf("multi-round merged session wrong: %+v", merged)
+	}
+	if _, ok := vr[merged.ResultID]; !ok {
+		t.Fatalf("reverse run missing merged identity %s: %+v", merged.ResultID, vr)
+	}
+
+	// 撤销总数与桥接轮次的先后无关：第一轮撤掉被并入的两个独立已发布会话
+	//（2 个）；第二轮把上一轮的合并结果与第三个已发布会话再并成一个，
+	// 两个旧标识都已发出过，再撤 2 个——共 4 个。
+	countKinds := func(out []aggregate.Output) (ins, corr, ret int) {
+		for _, o := range out {
+			switch o.Kind {
+			case aggregate.Insert:
+				ins++
+			case aggregate.Correction:
+				corr++
+			case aggregate.Retract:
+				ret++
+			}
+		}
+		return
+	}
+	_, _, retF := countKinds(fwd)
+	_, _, retR := countKinds(rev)
+	if retF != 4 || retR != 4 {
+		t.Fatalf("retractions fwd=%d rev=%d, want 4 each", retF, retR)
+	}
+
+	// 最终各自行集合一致（不依赖到达顺序）。
+	for id, ro := range vf {
+		go2, ok := vr[id]
+		if !ok || go2.Value != ro.Value || go2.Count != ro.Count ||
+			!go2.Window.Start.Equal(ro.Window.Start) || !go2.Window.End.Equal(ro.Window.End) {
+			t.Fatalf("reverse final row differs for %s:\n %+v\n %+v", id, ro, go2)
+		}
+	}
 }

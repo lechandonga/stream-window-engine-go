@@ -44,9 +44,9 @@ func main() {
 		// 输出序列中出现 RETRACT（撤销）+ 替代 INSERT。
 		events = []event.Event{
 			{ID: "s1", Key: "room-A", Ts: at(0), Value: 10},
-			{ID: "s2", Key: "room-A", Ts: at(12), Value: 20},
+			{ID: "s2", Key: "room-A", Ts: at(9), Value: 20},
 			{ID: "adv", Key: "room-A", Ts: at(40), Value: 0},   // 推进水位线：发布两个会话
-			{ID: "bridge", Key: "room-A", Ts: at(6), Value: 5}, // 迟到桥接：合并两个会话
+			{ID: "bridge", Key: "room-A", Ts: at(4), Value: 5}, // 迟到桥接：两侧间隔均 <=5s，合并两个会话
 		}
 		cfg = engine.Config{
 			Window:          window.Spec{Kind: window.Session, Gap: 5 * time.Second},
@@ -105,7 +105,13 @@ func main() {
 
 	var src source.Source
 	if *interrupt {
-		src = source.NewMemoryWithFailure(events, 5)
+		// 在投递完最后一条之前中断：已完成屏障均已检查点，
+		// 再次运行即从检查点续跑，输出不重复。
+		failAfter := len(events)
+		if failAfter > 0 {
+			failAfter--
+		}
+		src = source.NewMemoryWithFailure(events, failAfter)
 	} else {
 		src = source.NewMemory(events)
 	}

@@ -22,10 +22,25 @@
 |---|---|---|
 | 滚动 Tumbling | `Size` | 事件恰好属于 1 个窗口 |
 | 滑动 Sliding | `Size` + `Slide` | 事件可同时属于多个窗口（`Size/Slide` 个） |
-| 会话 Session | `Gap` | 初始单事件会话 `[ts, ts+Gap)`，相邻间隔 `<= Gap` 的会话确定地合并 |
+| 会话 Session | `Gap` | 初始单事件会话 `[ts, ts+Gap)`，相邻事件时间差 `<= Gap` 时确定地合并 |
 
-会话合并规则与输入顺序无关：按 `Start`（再按 `End`、`Seq`）排序后聚类，
-合并区间取并、`Seq` 取成员最小值，因此任何重放都得到相同会话。
+**会话间隔判定（唯一口径）**：把同组事件按时间排序得到
+`t1 <= t2 <= … <= tn`，从左到右聚类——
+
+- `t(i+1) - ti <= Gap`：两条事件属于**同一个**会话（时间差**恰好等于
+  上限也合并**；因为初始会话为 `[t, t+Gap)`，此时两个窗口首尾相接）；
+- `t(i+1) - ti > Gap`：在此切开，形成**两个独立**会话（哪怕只超过
+  `1ns`）；
+- 会话窗口为 `[首事件时间, 末事件时间+Gap)`；例如 `Gap=10s`、事件在
+  `0s` 与 `11s` → 两个会话 `[0,10)`、`[11,21)`；事件在 `0s、10s、30s`
+  → 两个会话 `[0,20)`、`[30,40)`。
+
+该判定只由**相邻事件时间差与配置上限**决定，与此前合并过几轮、
+事件到达顺序、会话结果是否已发布无关。实现上等价于“按 `Start`
+（再按 `End`、`Seq`）排序后，前一聚类窗口 `End >=` 当前窗口 `Start`
+即合并”；**不会在窗口区间之外再额外加一次 `Gap`**（那会把实际容忍
+间隔放大成 `2*Gap`）。合并后 `Seq` 取成员最小值，因此任何重放都
+得到相同会话与相同窗口标识。
 
 ### 异常时间事件（绝不静默丢弃）
 
@@ -89,23 +104,42 @@ W = maxObservedEventTime - Lag
 
 ### 撤销（RETRACT）：已发布结果被收回
 
-会话窗口可能随（迟到）数据继续合并：两个已经分别发布过的会话，
-会被一条迟到事件桥接成同一个更大的会话。此时旧标识的结果**不再成立**，
-引擎在同一屏障内、替代结果**之前**发出 `RETRACT`：
+会话窗口可能随（迟到）数据继续合并。只有当迟到事件**真的把两个
+（或多个）已发布会话桥接成同一个**——即排序后链路中每一段相邻事件
+时间差都 `<= Gap`——时，旧标识的结果才**不再成立**，引擎在同一
+屏障内、替代结果**之前**发出 `RETRACT`。
+
+反之，若迟到事件与任一已发布会话的相邻间隔都 `> Gap`，它属于
+**自己的独立会话**：已发布结果原样有效（连 `CORRECTION` 都不会有），
+引擎只按新会话正常发一份 `INSERT rev=1`，下游视图里两个会话各占一行。
+
+`Gap=5s` 的桥接示例（事件 `0s、9s` 已发布，迟到事件 `4s` 两段
+间隔均为 `4s <= 5s`）：
 
 ```
-seq=3 RETRACT key=room-A window=[00,05) rev=1 replaced_by=room-A|session:...:17...:1
-seq=4 RETRACT key=room-A window=[12,17) rev=1 replaced_by=room-A|session:...:17...:1
-seq=5 INSERT  key=room-A window=[00,17) rev=1            ← 替代结果（新标识）
+seq=3 RETRACT key=room-A window=[00,05)  rev=1 replaced_by=room-A|session:...:00:...:14:1
+seq=4 RETRACT key=room-A window=[09,14)  rev=1 replaced_by=room-A|session:...:00:...:14:1
+seq=5 INSERT  key=room-A window=[00,14)  rev=1 sum=35 count=3  ← 替代结果（新标识）
 ```
+
+上面这段输出可用 `go run ./cmd/demo -session` 在本地真实复现
+（见第 7 节）。若迟到事件落在 `5s+1ns` 或更晚（与 `0s` 的间隔
+`> 5s`），则序列中**没有任何 `RETRACT`**：`[00,05)` 原行保留，
+迟到会话作为新行出现。
 
 - `RETRACT` 记录精确携带被撤销结果的 `ResultID`、被撤销时的
   `Revision`/`Value`/`Count`，以及替代结果的 `ResultID`（`ReplacedBy`），
   下游不需要自己猜旧结果是否还有效；
+- 撤销只在“多成员聚类中、窗口标识与合并目标不同且该成员已发布”
+  时登记；某成员与相邻会话间隔超过 `Gap` 时根本不会进同一个聚类，
+  因而不可能被撤销；
 - 替代结果是**新标识**的 `INSERT rev=1`（每个标识有独立生命周期：
   `INSERT → CORRECTION… → RETRACT`）；
-- 若迟到事件并入后窗口标识不变（新区间被既有会话完全覆盖），
-  则走 `CORRECTION`，不产生撤销；
+- 若迟到事件并入后窗口标识不变（如恰好 `Gap` 处接上、扩展的是
+  已发布会话本身），则走 `CORRECTION`（或在首次发布前并入时直接
+  体现在首版 `INSERT` 中），不产生撤销；
+- 替代结果的起止、求和、计数只包含真正属于该会话的事件——
+  间隔超限的独立会话事件不会被算进来；
 - 滚动/滑动窗口边界固定、不会消失，因此不会产生 `RETRACT`，
   既有输出序列完全不变。
 
@@ -222,6 +256,11 @@ seq=5 INSERT  key=room-A window=[00,17) rev=1            ← 替代结果（新�
   新版本写出的快照不建议用旧版本读取；
 - **行为修复**（属于缺陷修复而非语义变更）：会话窗口下同一事件 ID 的
   重复投递/重启重放此前可能被二次计数，现与滚动/滑动窗口一致按 ID 去重。
+- **行为修复**（间隔判定）：会话聚类此前在初始会话窗口区间之外又
+  叠加了一次 `Gap`，实际容忍的相邻事件间隔被放大成 `2*Gap`
+  （如配 10s 时，0s 与 11s 会被误并）。现严格按
+  “相邻事件时间差 `<= Gap` 合并、`> Gap`（含仅超 1ns）分离”判定；
+  配置项、输出格式、检查点格式均不变，使用方无需改配置或数据格式。
 
 ---
 
@@ -249,6 +288,8 @@ go vet ./...
 | **撤销序列跨并发度一致（1/2/4/8）** | `engine.TestSessionRetractSameAcrossConcurrency` |
 | **撤销重启/重放不重复不遗漏** | `engine.TestSessionRetractSurvivesRestartAndReplay` |
 | **会话间隔边界（=Gap 合并 / >Gap 分离）** | `engine.TestSessionGapBoundary` |
+| **迟到事件超上限：不撤销已发布行、两个会话各占一行** | `engine.TestSessionLateEventBeyondGapKeepsPublishedRow` |
+| **多轮迟到合并与桥接顺序无关** | `engine.TestSessionMultiRoundMergeOrderIndependent` |
 | **同标识扩展走 CORRECTION 不撤销** | `engine.TestSessionExtensionSameIdentityCorrects` |
 | **会话窗口重复投递去重** | `engine.TestSessionDuplicateRedelivery` |
 | **背压/落盘下撤销完整** | `engine.TestSessionRetractUnderMemoryLimit`、`TestSessionRetractWithSpillAcrossRestart` |
@@ -271,6 +312,11 @@ go run ./cmd/demo -dir /tmp/swe-demo
 # 会话窗口撤销演示：两个已发布会话被迟到事件桥接合并，
 # 输出中可见 RETRACT（含 replaced_by）+ 替代 INSERT
 go run ./cmd/demo -dir /tmp/swe-demo-session -session
+
+# 只跑会话边界与撤销相关用例（恰好上限合并 / 超 1ns 分离 /
+# 迟到超上限不撤销 / 多轮合并 / 并发度 / 重启重放）
+go test ./internal/engine/ -run 'TestSession' -v
+go test ./internal/window/ -run 'TestMergeSessions' -v
 
 # 模拟来源中断（退出码 2），已完成屏障均已检查点
 go run ./cmd/demo -dir /tmp/swe-demo -interrupt

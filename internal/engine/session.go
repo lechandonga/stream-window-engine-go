@@ -109,7 +109,11 @@ func clusterSessions(keys []state.Key, gap time.Duration) []sessionCluster {
 	})
 	var clusters []sessionCluster
 	for _, k := range sorted {
-		if len(clusters) == 0 || clusters[len(clusters)-1].win.End.UnixNano()+int64(gap) < k.Win.Start.UnixNano() {
+		// 初始会话为 [事件时间, 事件时间+Gap)，故“相邻事件时间差 <= Gap”
+		// 等价于“前一聚类窗口的 End >= 当前窗口的 Start”（时间差恰好等于
+		// Gap 时首尾相接，也合并）。只比较时间，不额外再加 Gap，否则实际
+		// 容忍的事件间隔会被放大成 2*Gap。
+		if len(clusters) == 0 || clusters[len(clusters)-1].win.End.Before(k.Win.Start) {
 			clusters = append(clusters, sessionCluster{win: k.Win, members: []state.Key{k}})
 			continue
 		}
